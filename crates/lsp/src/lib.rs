@@ -1,19 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use lsp_server::{Connection, Message, Notification};
-use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-    Notification as _, PublishDiagnostics,
-};
-use lsp_types::{
+use tower_lsp::jsonrpc::Result as LspResult;
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, Position,
-    PublishDiagnosticsParams, Range, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, MarkupContent,
+    MarkupKind, OneOf, Position, Range, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
+use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+use beer_ast::{Func, Program, Type};
 use beer_codegen as codegen;
 use beer_driver as driver;
 use beer_errors::CompileError;
@@ -22,50 +23,42 @@ use beer_source::FileTable;
 type DynErr = Box<dyn Error + Sync + Send>;
 
 pub fn run() -> Result<(), DynErr> {
-    let (connection, io_threads) = Connection::stdio();
-
-    let capabilities = ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(
-            TextDocumentSyncKind::FULL,
-        )),
-        ..Default::default()
-    };
-    let init_params = connection.initialize(serde_json::to_value(&capabilities)?)?;
-    let _: InitializeParams = serde_json::from_value(init_params)?;
-
-    let mut state = ServerState::default();
-
-    for msg in &connection.receiver {
-        match msg {
-            Message::Request(req) => {
-                if connection.handle_shutdown(&req)? {
-                    break;
-                }
-            }
-            Message::Notification(not) => {
-                handle_notification(&connection, &mut state, not)?;
-            }
-            Message::Response(_) => {}
-        }
-    }
-
-    io_threads.join()?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_async());
     Ok(())
+}
+
+async fn run_async() {
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    let (service, socket) = LspService::new(|client| Backend {
+        client,
+        state: Mutex::new(ServerState::default()),
+    });
+    Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+struct Backend {
+    client: Client,
+    state: Mutex<ServerState>,
 }
 
 #[derive(Default)]
 struct ServerState {
-    /// Open documents — URI to current buffer text.
+    /// Open documents — URI as received from the client to current buffer text.
     docs: HashMap<Url, String>,
-    /// Canonical disk path to the URI the client sent. Editors track open
+    /// Canonical disk path -> the URI the client sent. Editors track open
     /// files by their original URI, so diagnostics must be published under
-    /// that URI — not the canonicalized form (which can differ, e.g. macOS
-    /// `/tmp` ↔ `/private/tmp`).
+    /// that URI — not the canonicalized form (`/tmp` vs `/private/tmp` etc.).
     canonical_to_uri: HashMap<PathBuf, Url>,
-    /// URIs we have published non-empty diagnostics for. Next compile pass
-    /// must publish empties to any URI no longer reporting, to clear stale
+    /// URIs we published non-empty diagnostics to last pass. On the next
+    /// pass we must publish empties to any that drop out, to clear stale
     /// squiggles in closed files.
     last_reported: HashSet<Url>,
+    /// Function name -> formatted signature ("fn add(a: int, b: int) -> int").
+    /// Cached from the most recent successful driver pass; powers completion
+    /// and hover even when the current buffer has parse errors.
+    fn_signatures: HashMap<String, String>,
 }
 
 impl ServerState {
@@ -83,118 +76,311 @@ impl ServerState {
         self.canonical_to_uri.retain(|_, u| u != uri);
     }
 
-    fn client_uri(&self, canonical: &PathBuf) -> Option<Url> {
+    fn client_uri(&self, canonical: &Path) -> Option<Url> {
         self.canonical_to_uri.get(canonical).cloned()
     }
 }
 
-fn handle_notification(
-    connection: &Connection,
-    state: &mut ServerState,
-    not: Notification,
-) -> Result<(), DynErr> {
-    match not.method.as_str() {
-        DidOpenTextDocument::METHOD => {
-            let params: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
-            let uri = params.text_document.uri.clone();
-            state.remember(uri.clone(), params.text_document.text);
-            recompile(connection, state, &uri)?;
-        }
-        DidChangeTextDocument::METHOD => {
-            let params: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
-            if let Some(change) = params.content_changes.into_iter().last() {
-                state.remember(params.text_document.uri.clone(), change.text);
-            }
-            recompile(connection, state, &params.text_document.uri)?;
-        }
-        DidSaveTextDocument::METHOD => {
-            let params: DidSaveTextDocumentParams = serde_json::from_value(not.params)?;
-            if let Some(text) = params.text {
-                state.remember(params.text_document.uri.clone(), text);
-            }
-            recompile(connection, state, &params.text_document.uri)?;
-        }
-        DidCloseTextDocument::METHOD => {
-            let params: DidCloseTextDocumentParams = serde_json::from_value(not.params)?;
-            let uri = params.text_document.uri;
-            state.forget(&uri);
-            publish(connection, &uri, vec![])?;
-            state.last_reported.remove(&uri);
-        }
-        _ => {}
+#[tower_lsp::async_trait]
+impl LanguageServer for Backend {
+    async fn initialize(&self, _: InitializeParams) -> LspResult<InitializeResult> {
+        Ok(InitializeResult {
+            capabilities: ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
+                )),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(false),
+                    trigger_characters: None,
+                    ..Default::default()
+                }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(false)),
+                ..Default::default()
+            },
+            server_info: Some(ServerInfo {
+                name: "beer".into(),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+            }),
+        })
     }
-    Ok(())
+
+    async fn initialized(&self, _: InitializedParams) {}
+
+    async fn shutdown(&self) -> LspResult<()> {
+        Ok(())
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        {
+            let mut st = self.state.lock().unwrap();
+            st.remember(uri.clone(), params.text_document.text);
+        }
+        self.recompile(&uri).await;
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        if let Some(change) = params.content_changes.into_iter().last() {
+            let mut st = self.state.lock().unwrap();
+            st.remember(uri.clone(), change.text);
+        }
+        self.recompile(&uri).await;
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        if let Some(text) = params.text {
+            let mut st = self.state.lock().unwrap();
+            st.remember(uri.clone(), text);
+        }
+        self.recompile(&uri).await;
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri;
+        {
+            let mut st = self.state.lock().unwrap();
+            st.forget(&uri);
+            st.last_reported.remove(&uri);
+        }
+        self.client.publish_diagnostics(uri, vec![], None).await;
+    }
+
+    async fn completion(&self, _: CompletionParams) -> LspResult<Option<CompletionResponse>> {
+        const KEYWORDS: &[&str] = &[
+            "let", "fn", "if", "else", "while", "return", "true", "false", "as", "use", "print",
+        ];
+        const TYPES: &[&str] = &["int", "float", "bool", "str"];
+
+        let sigs = {
+            let st = self.state.lock().unwrap();
+            st.fn_signatures.clone()
+        };
+
+        let mut items = Vec::with_capacity(KEYWORDS.len() + TYPES.len() + sigs.len());
+        for kw in KEYWORDS {
+            items.push(CompletionItem {
+                label: (*kw).into(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                ..Default::default()
+            });
+        }
+        for t in TYPES {
+            items.push(CompletionItem {
+                label: (*t).into(),
+                kind: Some(CompletionItemKind::TYPE_PARAMETER),
+                ..Default::default()
+            });
+        }
+        for (name, sig) in sigs {
+            items.push(CompletionItem {
+                label: name,
+                detail: Some(sig),
+                kind: Some(CompletionItemKind::FUNCTION),
+                ..Default::default()
+            });
+        }
+        Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+
+        let (source, sig) = {
+            let st = self.state.lock().unwrap();
+            let text = st.docs.get(&uri).cloned().unwrap_or_default();
+            let word = word_at(&text, pos.line as usize, pos.character as usize);
+            let sig = word.and_then(|w| {
+                keyword_hover(w)
+                    .map(|s| s.to_string())
+                    .or_else(|| st.fn_signatures.get(w).cloned())
+            });
+            (text, sig)
+        };
+        let _ = source; // kept for symmetry; not used further
+
+        let Some(text) = sig else {
+            return Ok(None);
+        };
+
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```beer\n{}\n```", text),
+            }),
+            range: None,
+        }))
+    }
 }
 
-fn recompile(
-    connection: &Connection,
-    state: &mut ServerState,
-    focused: &Url,
-) -> Result<(), DynErr> {
-    let Ok(root_path) = focused.to_file_path() else {
-        return Ok(());
-    };
+fn word_at(text: &str, line: usize, col: usize) -> Option<&str> {
+    let line_text = text.lines().nth(line)?;
+    let bytes = line_text.as_bytes();
+    if col > bytes.len() {
+        return None;
+    }
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // The cursor can sit immediately after the word (col == end). Walk left
+    // from min(col, len-1) to find the identifier.
+    let probe = col.min(bytes.len().saturating_sub(1));
+    if bytes.is_empty() || !is_id(bytes[probe]) {
+        return None;
+    }
+    let mut start = probe;
+    while start > 0 && is_id(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = probe;
+    while end < bytes.len() && is_id(bytes[end]) {
+        end += 1;
+    }
+    Some(&line_text[start..end])
+}
 
-    // Seed every open doc as an overlay so unsaved buffers feed into the
-    // compiler pipeline instead of the on-disk copy.
-    let mut files = FileTable::new();
-    for (uri, text) in &state.docs {
-        if let Ok(p) = uri.to_file_path() {
-            files.set_overlay(p, text.clone());
+fn keyword_hover(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "let" => "let — declare a (mutable) variable",
+        "fn" => "fn — declare a function",
+        "if" => "if — conditional branch",
+        "else" => "else — alternate branch of an `if`",
+        "while" => "while — loop while a condition holds",
+        "return" => "return — return a value from the enclosing function",
+        "true" | "false" => "bool literal",
+        "as" => "as — cast between int and float",
+        "use" => "use \"path.beer\" — import another file",
+        "print" => "print(x) — built-in, prints an int / float / str / bool",
+        "int" => "int — 64-bit signed integer",
+        "float" => "float — 64-bit floating-point number",
+        "bool" => "bool — true / false",
+        "str" => "str — null-terminated string (C-string)",
+        _ => return None,
+    })
+}
+
+impl Backend {
+    async fn recompile(&self, focused: &Url) {
+        let Ok(root_path) = focused.to_file_path() else {
+            return;
+        };
+
+        // Snapshot open-doc overlays under the lock, then drop it before the
+        // compile — we don't want to hold state across CPU-heavy work.
+        let overlays: Vec<(PathBuf, String)> = {
+            let st = self.state.lock().unwrap();
+            st.docs
+                .iter()
+                .filter_map(|(uri, text)| uri.to_file_path().ok().map(|p| (p, text.clone())))
+                .collect()
+        };
+
+        let mut files = FileTable::new();
+        for (p, text) in overlays {
+            files.set_overlay(p, text);
         }
-    }
 
-    let compile_error = run_pipeline(files, &root_path);
+        let (program_opt, compile_error) = run_pipeline(files, &root_path);
 
-    // Bucket diagnostics by URI. Pre-seed every currently-open doc with an
-    // empty list so stale squiggles from prior passes are cleared.
-    let mut by_uri: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
-    for uri in state.docs.keys() {
-        by_uri.insert(uri.clone(), Vec::new());
-    }
+        // Refresh the cached symbol table whenever parsing succeeded (even
+        // if codegen later errored), so completion + hover stay useful while
+        // the user is mid-edit.
+        if let Some(prog) = program_opt {
+            let sigs: HashMap<String, String> = prog
+                .funcs
+                .iter()
+                .map(|f| (f.name.clone(), format_signature(f)))
+                .collect();
+            let mut st = self.state.lock().unwrap();
+            st.fn_signatures = sigs;
+        }
 
-    if let Some((err, files_opt)) = compile_error {
-        let (uri, range) = diag_location(&err, files_opt.as_ref(), focused, state);
-        by_uri
-            .entry(uri)
-            .or_default()
-            .push(Diagnostic {
+        // Bucket diagnostics by URI. Seed every currently-open doc with an
+        // empty vec so stale errors from prior passes get cleared.
+        let open_uris: Vec<Url> = {
+            let st = self.state.lock().unwrap();
+            st.docs.keys().cloned().collect()
+        };
+        let mut by_uri: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
+        for uri in &open_uris {
+            by_uri.insert(uri.clone(), Vec::new());
+        }
+
+        if let Some((err, files_opt)) = compile_error {
+            let (uri, range) = {
+                let st = self.state.lock().unwrap();
+                diag_location(&err, files_opt.as_ref(), focused, &st)
+            };
+            by_uri.entry(uri).or_default().push(Diagnostic {
                 range,
                 severity: Some(DiagnosticSeverity::ERROR),
                 source: Some("beer".into()),
                 message: err.msg,
                 ..Default::default()
             });
-    }
-
-    // Clear any URIs we previously reported to that aren't in this batch.
-    for stale in state.last_reported.iter() {
-        by_uri.entry(stale.clone()).or_default();
-    }
-
-    let mut new_reported = HashSet::new();
-    for (uri, diags) in by_uri {
-        if !diags.is_empty() {
-            new_reported.insert(uri.clone());
         }
-        publish(connection, &uri, diags)?;
-    }
-    state.last_reported = new_reported;
 
-    Ok(())
+        // Also clear any URIs we reported to last pass that aren't in this batch.
+        let prev: Vec<Url> = {
+            let st = self.state.lock().unwrap();
+            st.last_reported.iter().cloned().collect()
+        };
+        for stale in prev {
+            by_uri.entry(stale).or_default();
+        }
+
+        let mut new_reported = HashSet::new();
+        for (uri, diags) in by_uri {
+            if !diags.is_empty() {
+                new_reported.insert(uri.clone());
+            }
+            self.client.publish_diagnostics(uri, diags, None).await;
+        }
+
+        let mut st = self.state.lock().unwrap();
+        st.last_reported = new_reported;
+    }
 }
 
-/// Run driver + codegen check; return any error alongside the (partial) file table.
+/// Run driver + codegen check. Returns both the parsed Program (if the driver
+/// reached it, regardless of codegen) and any error along with the FileTable
+/// for source lookup during diagnostic rendering.
 fn run_pipeline(
     files: FileTable,
-    root: &std::path::Path,
-) -> Option<(CompileError, Option<FileTable>)> {
+    root: &Path,
+) -> (Option<Program>, Option<(CompileError, Option<FileTable>)>) {
     match driver::load_program_with(files, root) {
         Ok((program, ft)) => match codegen::compile(&program, None) {
-            Ok(()) => None,
-            Err(e) => Some((e, Some(ft))),
+            Ok(()) => (Some(program), None),
+            Err(e) => (Some(program), Some((e, Some(ft)))),
         },
-        Err((ft, e)) => Some((e, Some(ft))),
+        Err((ft, e)) => (None, Some((e, Some(ft)))),
+    }
+}
+
+fn format_signature(f: &Func) -> String {
+    let params = f
+        .params
+        .iter()
+        .map(|(n, t)| format!("{}: {}", n, format_type(*t)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ret = if f.ret == Type::Void {
+        String::new()
+    } else {
+        format!(" -> {}", format_type(f.ret))
+    };
+    format!("fn {}({}){}", f.name, params, ret)
+}
+
+fn format_type(t: Type) -> &'static str {
+    match t {
+        Type::Int => "int",
+        Type::Float => "float",
+        Type::Bool => "bool",
+        Type::Str => "str",
+        Type::Void => "void",
     }
 }
 
@@ -224,18 +410,4 @@ fn diag_location(
         end: Position { line: 0, character: 0 },
     };
     (fallback.clone(), range)
-}
-
-fn publish(connection: &Connection, uri: &Url, diagnostics: Vec<Diagnostic>) -> Result<(), DynErr> {
-    let params = PublishDiagnosticsParams {
-        uri: uri.clone(),
-        diagnostics,
-        version: None,
-    };
-    let not = Notification {
-        method: PublishDiagnostics::METHOD.to_string(),
-        params: serde_json::to_value(&params)?,
-    };
-    connection.sender.send(Message::Notification(not))?;
-    Ok(())
 }

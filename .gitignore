@@ -1,1 +1,12 @@
 /target
+
+# Standalone workspaces inside the repo each have their own target/
+extensions/*/target/
+grammars/*/target/
+
+# Built artifacts — extension wasm + tree-sitter npm scaffolding
+extensions/*/*.wasm
+extensions/*/grammars/
+grammars/*/node_modules/
+grammars/*/prebuilds/
+grammars/*/build/

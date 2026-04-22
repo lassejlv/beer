@@ -72,7 +72,11 @@ impl Parser {
                 self.pos += 1;
                 Ok(s)
             }
-            other => Err(self.error(format!("expected {:?}, got {:?}", t, other))),
+            other => Err(self.error(format!(
+                "expected {}, got {}",
+                token_display(t),
+                token_display_opt(other)
+            ))),
         }
     }
 
@@ -82,7 +86,10 @@ impl Parser {
             Some((Token::Ident(s), _)) => Ok((s, span)),
             other => Err(CompileError::at(
                 span,
-                format!("expected identifier, got {:?}", other.map(|(t, _)| t)),
+                format!(
+                    "expected identifier, got {}",
+                    token_display_opt(other.as_ref().map(|(t, _)| t))
+                ),
             )),
         }
     }
@@ -99,7 +106,10 @@ impl Parser {
             },
             other => Err(CompileError::at(
                 span,
-                format!("expected type, got {:?}", other.map(|(t, _)| t)),
+                format!(
+                    "expected type, got {}",
+                    token_display_opt(other.as_ref().map(|(t, _)| t))
+                ),
             )),
         }
     }
@@ -111,7 +121,10 @@ impl Parser {
             Some((Token::Str(s), _)) => Ok(UseDecl { path: s, span }),
             other => Err(CompileError::at(
                 path_span,
-                format!("`use` requires a string path, got {:?}", other.map(|(t, _)| t)),
+                format!(
+                    "`use` requires a string path, got {}",
+                    token_display_opt(other.as_ref().map(|(t, _)| t))
+                ),
             )),
         }
     }
@@ -146,10 +159,16 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, CompileError> {
-        self.expect(&Token::LBrace)?;
+        let open_span = self.expect(&Token::LBrace)?;
         let mut stmts = Vec::new();
         while self.peek() != Some(&Token::RBrace) && !self.eof() {
             stmts.push(self.parse_stmt()?);
+        }
+        if self.eof() {
+            return Err(CompileError::at(
+                open_span,
+                "unclosed `{` — missing matching `}`",
+            ));
         }
         self.expect(&Token::RBrace)?;
         Ok(stmts)
@@ -300,9 +319,59 @@ impl Parser {
             }
             other => Err(CompileError::at(
                 span,
-                format!("unexpected token in expression: {:?}", other.map(|(t, _)| t)),
+                format!(
+                    "unexpected {} in expression",
+                    token_display_opt(other.as_ref().map(|(t, _)| t))
+                ),
             )),
         }
+    }
+}
+
+fn token_display(t: &Token) -> String {
+    match t {
+        Token::Let => "`let`".into(),
+        Token::Fn => "`fn`".into(),
+        Token::If => "`if`".into(),
+        Token::Else => "`else`".into(),
+        Token::While => "`while`".into(),
+        Token::Return => "`return`".into(),
+        Token::True => "`true`".into(),
+        Token::False => "`false`".into(),
+        Token::As => "`as`".into(),
+        Token::Use => "`use`".into(),
+        Token::Int(_) => "integer literal".into(),
+        Token::Float(_) => "float literal".into(),
+        Token::Str(_) => "string literal".into(),
+        Token::Ident(s) => format!("`{}`", s),
+        Token::LParen => "`(`".into(),
+        Token::RParen => "`)`".into(),
+        Token::LBrace => "`{`".into(),
+        Token::RBrace => "`}`".into(),
+        Token::Comma => "`,`".into(),
+        Token::Colon => "`:`".into(),
+        Token::Arrow => "`->`".into(),
+        Token::Eq => "`=`".into(),
+        Token::EqEq => "`==`".into(),
+        Token::BangEq => "`!=`".into(),
+        Token::Bang => "`!`".into(),
+        Token::Lt => "`<`".into(),
+        Token::LtEq => "`<=`".into(),
+        Token::Gt => "`>`".into(),
+        Token::GtEq => "`>=`".into(),
+        Token::AndAnd => "`&&`".into(),
+        Token::OrOr => "`||`".into(),
+        Token::Plus => "`+`".into(),
+        Token::Minus => "`-`".into(),
+        Token::Star => "`*`".into(),
+        Token::Slash => "`/`".into(),
+    }
+}
+
+fn token_display_opt(t: Option<&Token>) -> String {
+    match t {
+        Some(t) => token_display(t),
+        None => "end of file".into(),
     }
 }
 

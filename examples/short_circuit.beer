@@ -1,4 +1,4 @@
-fn main() {
+fn main() -> str {
     let x = 0
     if x != 0 && 10 / x > 0 {
         print("unreachable")

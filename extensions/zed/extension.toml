@@ -1,0 +1,21 @@
+id = "beer"
+name = "Beer"
+version = "0.1.0"
+schema_version = 1
+authors = ["Lasse <vestergaardlasse2@gmail.com>"]
+description = "Beer language support — file association + LSP via the `beer` CLI"
+repository = "https://github.com/lassejlv/beer"
+
+[language_servers.beer]
+name = "Beer LSP"
+languages = ["Beer"]
+
+# Tree-sitter grammar for syntax highlighting.
+#
+# The grammar source lives at `grammars/tree-sitter-beer/` in this repo. To ship
+# this extension through Zed's official registry, push that directory to its own
+# repo (e.g. `https://github.com/lassejlv/tree-sitter-beer`) and replace
+# `commit` below with the actual hash.
+[grammars.beer]
+repository = "https://github.com/lassejlv/tree-sitter-beer"
+commit = "0000000000000000000000000000000000000000"
