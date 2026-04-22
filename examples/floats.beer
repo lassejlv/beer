@@ -1,0 +1,16 @@
+fn mean(a: float, b: float) -> float {
+    return (a + b) / 2.0
+}
+
+fn main() {
+    let pi = 3.14
+    print(pi)
+    print(mean(1.0, 4.0))
+
+    let n = 10
+    let f = n as float
+    print(f / 4.0)
+
+    let r = (f / 4.0) as int
+    print(r)
+}

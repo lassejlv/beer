@@ -1,0 +1,24 @@
+fn add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn main() {
+    let x = 10
+    let y = add(x, 32)
+    print(y)
+
+    let msg = "beer brewed"
+    print(msg)
+
+    let i = 0
+    while i < 3 {
+        print(i)
+        i = i + 1
+    }
+
+    if y == 42 {
+        print(true)
+    } else {
+        print(false)
+    }
+}
