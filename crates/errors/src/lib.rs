@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::span::Span;
+use beer_span::Span;
 
 #[derive(Debug)]
 pub struct CompileError {

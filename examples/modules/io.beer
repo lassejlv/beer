@@ -1,0 +1,5 @@
+use "math.beer"
+
+fn shout(x: int) {
+    print(mul(x, 10))
+}

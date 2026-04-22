@@ -1,0 +1,13 @@
+[package]
+name = "beer-codegen"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+beer-ast = { path = "../ast" }
+beer-errors = { path = "../errors" }
+beer-span = { path = "../span" }
+inkwell.workspace = true

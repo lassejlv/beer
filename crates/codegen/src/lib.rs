@@ -11,9 +11,9 @@ use inkwell::{
     values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue},
 };
 
-use crate::ast::*;
-use crate::error::CompileError;
-use crate::span::Span;
+use beer_ast::*;
+use beer_errors::CompileError;
+use beer_span::Span;
 
 pub fn compile(program: &Program, obj_path: Option<&Path>) -> Result<(), CompileError> {
     let ctx = Context::create();

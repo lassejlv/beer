@@ -1,0 +1,7 @@
+use "math.beer"
+use "io.beer"
+
+fn main() {
+    print(add(2, 3))
+    shout(4)
+}

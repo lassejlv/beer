@@ -1,0 +1,10 @@
+[package]
+name = "beer-ast"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+beer-span = { path = "../span" }

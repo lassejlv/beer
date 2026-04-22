@@ -1,0 +1,15 @@
+[package]
+name = "beer-driver"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+beer-ast = { path = "../ast" }
+beer-errors = { path = "../errors" }
+beer-lexer = { path = "../lexer" }
+beer-parser = { path = "../parser" }
+beer-source = { path = "../source" }
+beer-span = { path = "../span" }

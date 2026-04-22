@@ -1,0 +1,11 @@
+[package]
+name = "beer-lexer"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+beer-errors = { path = "../errors" }
+beer-span = { path = "../span" }

@@ -1,17 +1,13 @@
-mod ast;
-mod codegen;
-mod error;
-mod lexer;
-mod parser;
-mod span;
-
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use clap::{Parser, Subcommand};
 
-use error::CompileError;
+use beer_codegen as codegen;
+use beer_driver as driver;
+use beer_errors::CompileError;
+use beer_source::FileTable;
 
 #[derive(Parser)]
 #[command(name = "beer", version, about = "A minimal compiled language", long_about = None)]
@@ -40,6 +36,9 @@ enum Cmd {
         /// Source file (.beer)
         input: PathBuf,
     },
+    /// Run the Language Server Protocol implementation on stdio.
+    /// Your editor launches `beer lsp` and talks JSON-RPC over stdin/stdout.
+    Lsp,
 }
 
 fn main() -> ExitCode {
@@ -48,34 +47,37 @@ fn main() -> ExitCode {
         Cmd::Build { input, output } => cmd_build(&input, output.as_deref()),
         Cmd::Run { input } => cmd_run(&input),
         Cmd::Check { input } => cmd_check(&input),
+        Cmd::Lsp => cmd_lsp(),
+    }
+}
+
+fn cmd_lsp() -> ExitCode {
+    match beer_lsp::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("beer lsp: {}", e);
+            ExitCode::FAILURE
+        }
     }
 }
 
 fn cmd_build(input: &Path, output: Option<&Path>) -> ExitCode {
-    let src = match read_source(input) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
     let out = output
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| default_output(input));
-    match compile_and_link(&src, &out) {
+    match compile_and_link(input, &out) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            render_error(input, &src, &e);
+        Err((files, e)) => {
+            render_error(input, files.as_ref(), &e);
             ExitCode::FAILURE
         }
     }
 }
 
 fn cmd_run(input: &Path) -> ExitCode {
-    let src = match read_source(input) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
     let bin = std::env::temp_dir().join(format!("beer-run-{}", std::process::id()));
-    if let Err(e) = compile_and_link(&src, &bin) {
-        render_error(input, &src, &e);
+    if let Err((files, e)) = compile_and_link(input, &bin) {
+        render_error(input, files.as_ref(), &e);
         let _ = std::fs::remove_file(&bin);
         return ExitCode::FAILURE;
     }
@@ -94,51 +96,57 @@ fn cmd_run(input: &Path) -> ExitCode {
 }
 
 fn cmd_check(input: &Path) -> ExitCode {
-    let src = match read_source(input) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    match run_check(&src) {
+    match run_check(input) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            render_error(input, &src, &e);
+        Err((files, e)) => {
+            render_error(input, files.as_ref(), &e);
             ExitCode::FAILURE
         }
     }
 }
 
-fn read_source(input: &Path) -> Result<String, ExitCode> {
-    std::fs::read_to_string(input).map_err(|e| {
-        eprintln!("beer: cannot read {}: {}", input.display(), e);
-        ExitCode::FAILURE
-    })
-}
+type PipelineError = (Option<FileTable>, CompileError);
 
-fn compile_and_link(src: &str, output: &Path) -> Result<(), CompileError> {
-    let tokens = lexer::tokenize(src)?;
-    let program = parser::parse(tokens)?;
+fn compile_and_link(input: &Path, output: &Path) -> Result<(), PipelineError> {
+    let (program, files) = match driver::load_program(input) {
+        Ok(v) => v,
+        Err((files, e)) => return Err((Some(files), e)),
+    };
 
     let obj = std::env::temp_dir().join(format!("beer-{}.o", std::process::id()));
-    codegen::compile(&program, Some(&obj))?;
+    if let Err(e) = codegen::compile(&program, Some(&obj)) {
+        return Err((Some(files), e));
+    }
 
-    let status = Command::new("cc")
-        .arg(&obj)
-        .arg("-o")
-        .arg(output)
-        .status()
-        .map_err(|e| CompileError::new(format!("failed to invoke cc: {}", e)))?;
+    let status = match Command::new("cc").arg(&obj).arg("-o").arg(output).status() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_file(&obj);
+            return Err((
+                Some(files),
+                CompileError::new(format!("failed to invoke cc: {}", e)),
+            ));
+        }
+    };
     let _ = std::fs::remove_file(&obj);
 
     if !status.success() {
-        return Err(CompileError::new(format!("linker exited with {}", status)));
+        return Err((
+            Some(files),
+            CompileError::new(format!("linker exited with {}", status)),
+        ));
     }
     Ok(())
 }
 
-fn run_check(src: &str) -> Result<(), CompileError> {
-    let tokens = lexer::tokenize(src)?;
-    let program = parser::parse(tokens)?;
-    codegen::compile(&program, None)?;
+fn run_check(input: &Path) -> Result<(), PipelineError> {
+    let (program, files) = match driver::load_program(input) {
+        Ok(v) => v,
+        Err((files, e)) => return Err((Some(files), e)),
+    };
+    if let Err(e) = codegen::compile(&program, None) {
+        return Err((Some(files), e));
+    }
     Ok(())
 }
 
@@ -150,7 +158,7 @@ fn default_output(input: &Path) -> PathBuf {
     PathBuf::from(stem)
 }
 
-fn render_error(path: &Path, src: &str, err: &CompileError) {
+fn render_error(fallback_path: &Path, files: Option<&FileTable>, err: &CompileError) {
     let color = std::io::stderr().is_terminal();
     let red = if color { "\x1b[31;1m" } else { "" };
     let bold = if color { "\x1b[1m" } else { "" };
@@ -159,17 +167,27 @@ fn render_error(path: &Path, src: &str, err: &CompileError) {
 
     eprintln!("{red}error{reset}{bold}: {}{reset}", err.msg);
 
-    if let Some(s) = err.span {
-        eprintln!(" {cyan}-->{reset} {}:{}:{}", path.display(), s.line, s.col);
-        if let Some(line_text) = src.lines().nth((s.line - 1) as usize) {
-            let line_num = s.line.to_string();
-            let pad = " ".repeat(line_num.len());
-            eprintln!("  {pad}{cyan}|{reset}");
-            eprintln!("  {cyan}{line_num} |{reset} {line_text}");
-            eprintln!(
-                "  {pad}{cyan}|{reset} {}{red}^{reset}",
-                " ".repeat((s.col as usize).saturating_sub(1))
-            );
+    let Some(s) = err.span else {
+        return;
+    };
+
+    let (path_disp, source_text) = match files {
+        Some(ft) => {
+            let f = ft.get(s.file);
+            (f.path.display().to_string(), f.source.as_str())
         }
+        None => (fallback_path.display().to_string(), ""),
+    };
+
+    eprintln!(" {cyan}-->{reset} {}:{}:{}", path_disp, s.line, s.col);
+    if let Some(line_text) = source_text.lines().nth((s.line - 1) as usize) {
+        let line_num = s.line.to_string();
+        let pad = " ".repeat(line_num.len());
+        eprintln!("  {pad}{cyan}|{reset}");
+        eprintln!("  {cyan}{line_num} |{reset} {line_text}");
+        eprintln!(
+            "  {pad}{cyan}|{reset} {}{red}^{reset}",
+            " ".repeat((s.col as usize).saturating_sub(1))
+        );
     }
 }

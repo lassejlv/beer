@@ -1,4 +1,4 @@
-use crate::span::Span;
+use beer_span::Span;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Type {
@@ -68,6 +68,18 @@ pub struct Func {
     pub ret: Type,
     pub body: Vec<Stmt>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct UseDecl {
+    pub path: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedFile {
+    pub uses: Vec<UseDecl>,
+    pub funcs: Vec<Func>,
 }
 
 #[derive(Debug, Clone)]

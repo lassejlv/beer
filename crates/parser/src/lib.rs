@@ -1,15 +1,28 @@
-use crate::ast::*;
-use crate::error::CompileError;
-use crate::lexer::Token;
-use crate::span::Span;
+use beer_ast::*;
+use beer_errors::CompileError;
+use beer_lexer::Token;
+use beer_span::Span;
 
-pub fn parse(tokens: Vec<(Token, Span)>) -> Result<Program, CompileError> {
+pub fn parse(tokens: Vec<(Token, Span)>) -> Result<ParsedFile, CompileError> {
     let mut p = Parser { toks: tokens, pos: 0 };
+    let mut uses = Vec::new();
     let mut funcs = Vec::new();
-    while !p.eof() {
-        funcs.push(p.parse_func()?);
+
+    while p.peek() == Some(&Token::Use) {
+        uses.push(p.parse_use()?);
     }
-    Ok(Program { funcs })
+    while !p.eof() {
+        match p.peek() {
+            Some(Token::Use) => {
+                return Err(CompileError::at(
+                    p.span_here(),
+                    "`use` declarations must appear before any `fn`",
+                ));
+            }
+            _ => funcs.push(p.parse_func()?),
+        }
+    }
+    Ok(ParsedFile { uses, funcs })
 }
 
 struct Parser {
@@ -35,7 +48,7 @@ impl Parser {
             .get(self.pos)
             .map(|(_, s)| *s)
             .or_else(|| self.toks.last().map(|(_, s)| *s))
-            .unwrap_or_else(|| Span::new(1, 1))
+            .unwrap_or_else(|| Span::new(0, 1, 1))
     }
 
     fn error(&self, msg: impl Into<String>) -> CompileError {
@@ -87,6 +100,18 @@ impl Parser {
             other => Err(CompileError::at(
                 span,
                 format!("expected type, got {:?}", other.map(|(t, _)| t)),
+            )),
+        }
+    }
+
+    fn parse_use(&mut self) -> Result<UseDecl, CompileError> {
+        let span = self.expect(&Token::Use)?;
+        let path_span = self.span_here();
+        match self.advance() {
+            Some((Token::Str(s), _)) => Ok(UseDecl { path: s, span }),
+            other => Err(CompileError::at(
+                path_span,
+                format!("`use` requires a string path, got {:?}", other.map(|(t, _)| t)),
             )),
         }
     }

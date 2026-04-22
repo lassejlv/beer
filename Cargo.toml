@@ -1,7 +1,18 @@
-[package]
-name = "beer"
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+
+[workspace.dependencies]
+inkwell = { version = "0.9", features = ["llvm21-1"] }
+
+[package]
+name = "beer"
+version.workspace = true
+edition.workspace = true
 
 [[bin]]
 name = "beer"
@@ -9,7 +20,11 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-inkwell = { version = "0.9", features = ["llvm21-1"] }
+beer-codegen = { path = "crates/codegen" }
+beer-driver = { path = "crates/driver" }
+beer-errors = { path = "crates/errors" }
+beer-lsp = { path = "crates/lsp" }
+beer-source = { path = "crates/source" }
 
 [profile.release]
 lto = "thin"

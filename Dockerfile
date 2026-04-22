@@ -19,6 +19,7 @@ ENV LLVM_SYS_210_PREFIX=/usr/lib/llvm-21
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY src ./src
 
 RUN cargo build --release --locked

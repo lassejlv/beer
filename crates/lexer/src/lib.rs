@@ -1,5 +1,5 @@
-use crate::error::CompileError;
-use crate::span::Span;
+use beer_errors::CompileError;
+use beer_span::Span;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -12,6 +12,7 @@ pub enum Token {
     True,
     False,
     As,
+    Use,
 
     Int(i64),
     Float(f64),
@@ -47,13 +48,14 @@ struct Lexer<'a> {
     src: std::str::Chars<'a>,
     buf0: Option<char>,
     buf1: Option<char>,
+    file: u32,
     line: u32,
     col: u32,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(src: &'a str) -> Self {
-        Self { src: src.chars(), buf0: None, buf1: None, line: 1, col: 1 }
+    fn new(src: &'a str, file: u32) -> Self {
+        Self { src: src.chars(), buf0: None, buf1: None, file, line: 1, col: 1 }
     }
 
     fn peek(&mut self) -> Option<char> {
@@ -84,12 +86,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn span(&self) -> Span {
-        Span::new(self.line, self.col)
+        Span::new(self.file, self.line, self.col)
     }
 }
 
-pub fn tokenize(src: &str) -> Result<Vec<(Token, Span)>, CompileError> {
-    let mut lx = Lexer::new(src);
+pub fn tokenize(src: &str, file: u32) -> Result<Vec<(Token, Span)>, CompileError> {
+    let mut lx = Lexer::new(src, file);
     let mut out = Vec::new();
 
     while let Some(c) = lx.peek() {
@@ -270,6 +272,7 @@ pub fn tokenize(src: &str) -> Result<Vec<(Token, Span)>, CompileError> {
                     "true" => Token::True,
                     "false" => Token::False,
                     "as" => Token::As,
+                    "use" => Token::Use,
                     _ => Token::Ident(name),
                 };
                 out.push((tok, start));
